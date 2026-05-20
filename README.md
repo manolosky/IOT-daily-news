@@ -1,4 +1,4 @@
-# hello_world_esp32
+# News API into LCD module
 
 ESP32 news ticker for a TFT display. The firmware connects the ESP32 to Wi‑Fi, fetches news articles from NewsAPI.org and displays titles and descriptions on a TFT using the `TFT_eSPI` library. It cycles through configurable categories and rotates articles periodically.
 
