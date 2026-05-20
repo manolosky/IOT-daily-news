@@ -4,6 +4,10 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
+#ifndef WIFI_SSID
+#include "secrets.h"
+#endif
+
 TFT_eSPI tft = TFT_eSPI();
 
 // WiFi configuration
