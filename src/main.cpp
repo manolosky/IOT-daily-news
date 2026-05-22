@@ -2,6 +2,7 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <time.h>
 
@@ -17,7 +18,7 @@ const char* password = WIFI_PASS;
 
 // NewsAPI configuration
 const char* apiKey = API_KEY;
-const char* apiBase = "http://newsapi.org/v2/everything?sortBy=popularity&language=es&apiKey=";
+const char* apiBase = "https://newsapi.org/v2/everything?sortBy=popularity&language=es&apiKey=";
 
 //Struct to hold news category and its respective duration for fetching news
 struct NewsCategory {
@@ -176,7 +177,7 @@ bool fetchNews(const char* query) {
     getYesterdayDateString(dateFrom, sizeof(dateFrom));
 
     char url[256];
-    sprintf(url, "%s%s&q=%s&from=%s&pageSize=10", apiBase, apiKey, query, dateFrom);
+    snprintf(url, sizeof(url), "%s%s&q=%s&from=%s&pageSize=10", apiBase, apiKey, query, dateFrom);
 
     Serial.printf("Fetching: %s\n", url);
     Serial.printf("Memoria libre: %d bytes\n", ESP.getFreeHeap());
@@ -185,11 +186,16 @@ bool fetchNews(const char* query) {
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
 
     char buffer[50];
-    sprintf(buffer, "Cargando: %s...", query);
+    snprintf(buffer, sizeof(buffer), "Cargando: %s...", query);
     tft.drawString(buffer, 10, 10, 2);
 
+    // NewsAPI is served over HTTPS; setInsecure() skips TLS certificate
+    // validation to avoid bundling a CA cert. Traffic is still encrypted.
+    WiFiClientSecure client;
+    client.setInsecure();
+
     HTTPClient http;
-    http.begin(url);
+    http.begin(client, url);
     http.setTimeout(15000);
 
     int httpCode = http.GET();
@@ -264,7 +270,7 @@ void displayArticle(int index) {
 
     // Header with category and counter
     char header[60];
-    sprintf(header, "%s [%d/%d]",
+    snprintf(header, sizeof(header), "%s [%d/%d]",
         categories[currentCategory].query,
         index + 1,
         totalArticles
