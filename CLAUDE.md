@@ -47,13 +47,17 @@ React standards do **not** apply here — this is an embedded C++ project.
 - Define display and peripheral pins as `build_flags` in `platformio.ini`,
   not as magic numbers scattered through the code.
 - Document any GPIO driven directly in `setup()`.
+- The built-in TFT_eSPI fonts only contain ASCII glyphs; fold any external
+  UTF-8 text to ASCII before drawing it (see `asciiFold`).
 
-## Secrets
+## Secrets & build-time configuration
 - Never commit credentials. `src/secrets.h` and `secrets.ini` are git-ignored.
-- Keep `src/secrets.h.example` in sync with the macros the firmware actually uses
-  (`WIFI_SSID`, `WIFI_PASS`, `API_KEY`).
-- Provide secrets via `src/secrets.h` or the `[secrets]` section that
+- Keep `src/secrets.h.example` in sync with the macros the firmware uses
+  (`WIFI_SSID`, `WIFI_PASS`, `API_KEY`, `WEATHER_CITY`, `WEATHER_COUNTRY`).
+- Provide values via `src/secrets.h` or the `[secrets]` section that
   `platformio.ini` pulls in through `extra_configs`.
+- In `secrets.ini`, build-flag values that contain spaces must be wrapped in
+  single quotes, e.g. `'-DWEATHER_CITY="Castellon de la Plana"'`.
 
 ## Dependencies
 - Declare every library in `platformio.ini` under `lib_deps` with a pinned

@@ -5,9 +5,16 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <stdlib.h>
+#include <strings.h>
 
 #ifndef WIFI_SSID
 #include "secrets.h"
+#endif
+
+// WEATHER_COUNTRY is optional; it disambiguates cities sharing the same name
+#ifndef WEATHER_COUNTRY
+#define WEATHER_COUNTRY ""
 #endif
 
 TFT_eSPI tft = TFT_eSPI();
@@ -37,7 +44,7 @@ NewsCategory categories[] = {
 const int totalCategories = sizeof(categories) / sizeof(categories[0]);
 
 // Struct article data
-#define MAX_ARTICLES 25
+#define MAX_ARTICLES 12
 #define MAX_TITLE 150
 #define MAX_DESC 300
 
@@ -51,10 +58,42 @@ int totalArticles = 0;
 int currentArticle = 0;
 int currentCategory = 0;
 
+// Current weather fetched from Open-Meteo
+struct WeatherData {
+    float temperature;       // degrees Celsius
+    int humidity;            // relative humidity, %
+    int precipitationProb;   // precipitation probability for the current hour, %
+    bool valid;
+};
+WeatherData weather = {0.0f, 0, 0, false};
+
+// Device location, resolved once at startup from the configured city
+double geoLat = 0.0;
+double geoLon = 0.0;
+bool geoValid = false;
+
+// World clocks shown on the info screen.
+// POSIX TZ strings: the device keeps UTC from NTP and these handle DST automatically.
+struct WorldClock {
+    const char* label;
+    const char* tz;
+};
+const WorldClock worldClocks[] = {
+    {"Colombia", "COT5"},
+    {"Espana",   "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Uruguay",  "UYT3"},
+    {"Texas",    "CST6CDT,M3.2.0,M11.1.0"},
+};
+const int totalClocks = sizeof(worldClocks) / sizeof(worldClocks[0]);
+
 // Timing variables
-unsigned long lastNewsSwitch = 0;
+unsigned long lastScreenSwitch = 0;
 unsigned long categoryStartTime = 0;
-const unsigned long NEWS_INTERVAL = 60 * 1000UL; // 1 minute
+unsigned long lastWeatherFetch = 0;
+bool showingInfo = false;
+
+const unsigned long SCREEN_INTERVAL = 60 * 1000UL;        // alternate screens every 1 minute
+const unsigned long WEATHER_INTERVAL = 30 * 60 * 1000UL;  // refresh weather every 30 minutes
 
 // Connect to WiFi
 void connectWiFi() {
@@ -77,9 +116,9 @@ void connectWiFi() {
     tft.fillScreen(TFT_WHITE);
     tft.drawString("Sincronizando hora...", 10, 10, 2);
     Serial.println("Sincronizando hora con NTP...");
-    
+
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    
+
     time_t now = time(nullptr);
     int attempts = 0;
     while (now < 24 * 3600 && attempts < 20) {
@@ -99,7 +138,7 @@ void connectWiFi() {
 // Get yesterday's date in YYYY-MM-DD format
 void getYesterdayDateString(char* buffer, size_t bufferSize) {
     time_t now = time(nullptr);
-    
+
     // If time is not synchronized, use hardcoded date
     if (now < 24 * 3600) {
         strncpy(buffer, "2026-05-20", bufferSize - 1);
@@ -107,18 +146,208 @@ void getYesterdayDateString(char* buffer, size_t bufferSize) {
         Serial.println("Advertencia: Hora no sincronizada, usando fecha por defecto");
         return;
     }
-    
+
     time_t yesterday = now - (24 * 60 * 60);
     struct tm* timeinfo = localtime(&yesterday);
-    
+
     if (timeinfo == nullptr) {
         strncpy(buffer, "2026-05-20", bufferSize - 1);
         buffer[bufferSize - 1] = '\0';
         Serial.println("Error: No se pudo obtener estructura de hora");
         return;
     }
-    
+
     strftime(buffer, bufferSize, "%Y-%m-%d", timeinfo);
+}
+
+// Perform an HTTPS GET and deserialize the JSON body using the given filter.
+// setInsecure() skips TLS certificate validation to avoid bundling a CA cert;
+// traffic is still encrypted.
+bool httpGetJson(const char* url, JsonDocument& doc, JsonDocument& filter) {
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, url);
+    http.setTimeout(15000);
+
+    int httpCode = http.GET();
+    if (httpCode != 200) {
+        Serial.printf("HTTP Error %d: %s\n", httpCode, url);
+        http.end();
+        return false;
+    }
+
+    DeserializationError error;
+    if (http.getSize() >= 0) {
+        // Content-Length is known: parse straight from the stream so the whole
+        // body never has to live in one large contiguous String.
+        error = deserializeJson(doc, http.getStream(),
+            DeserializationOption::Filter(filter));
+    } else {
+        // Chunked transfer: HTTPClient must de-chunk the body via getString().
+        String payload = http.getString();
+        error = deserializeJson(doc, payload,
+            DeserializationOption::Filter(filter));
+        payload = String();
+    }
+
+    http.end();
+
+    if (error) {
+        Serial.printf("JSON Error: %s\n", error.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+// Percent-encode a string for safe use in a URL query parameter
+void urlEncode(const char* src, char* dst, size_t dstSize) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 3 < dstSize; i++) {
+        unsigned char c = (unsigned char) src[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[j++] = (char) c;
+        } else {
+            dst[j++] = '%';
+            dst[j++] = hex[c >> 4];
+            dst[j++] = hex[c & 0x0F];
+        }
+    }
+    dst[j] = '\0';
+}
+
+// Resolve the configured city to coordinates using the Open-Meteo geocoding API
+bool resolveLocation() {
+    char cityEncoded[120];
+    urlEncode(WEATHER_CITY, cityEncoded, sizeof(cityEncoded));
+
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://geocoding-api.open-meteo.com/v1/search"
+        "?name=%s&count=5&language=es&format=json",
+        cityEncoded);
+
+    Serial.printf("Geocoding: %s\n", url);
+
+    JsonDocument filter;
+    filter["results"][0]["latitude"] = true;
+    filter["results"][0]["longitude"] = true;
+    filter["results"][0]["name"] = true;
+    filter["results"][0]["country"] = true;
+    filter["results"][0]["country_code"] = true;
+    filter["results"][0]["admin1"] = true;
+
+    JsonDocument doc;
+    if (!httpGetJson(url, doc, filter)) {
+        Serial.println("Error: no se pudo geocodificar la ciudad");
+        geoValid = false;
+        return false;
+    }
+
+    JsonArray results = doc["results"].as<JsonArray>();
+    if (results.isNull() || results.size() == 0) {
+        Serial.printf("Error: ciudad no encontrada: %s\n", WEATHER_CITY);
+        geoValid = false;
+        return false;
+    }
+
+    // When WEATHER_COUNTRY is set, prefer the result from that country
+    JsonObject match = results[0];
+    if (strlen(WEATHER_COUNTRY) > 0) {
+        for (JsonObject result : results) {
+            const char* country = result["country"] | "";
+            const char* code = result["country_code"] | "";
+            if (strcasecmp(country, WEATHER_COUNTRY) == 0 ||
+                strcasecmp(code, WEATHER_COUNTRY) == 0) {
+                match = result;
+                break;
+            }
+        }
+    }
+
+    geoLat = match["latitude"].as<double>();
+    geoLon = match["longitude"].as<double>();
+    geoValid = true;
+
+    Serial.printf("Ubicacion: %s, %s (%.4f, %.4f)\n",
+        match["name"] | WEATHER_CITY, match["admin1"] | "-", geoLat, geoLon);
+    return true;
+}
+
+// Fetch current weather from Open-Meteo for the resolved location
+bool fetchWeather() {
+    if (!geoValid) {
+        return false;
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+        "&current=temperature_2m,relative_humidity_2m"
+        "&hourly=precipitation_probability&forecast_days=1&timezone=auto",
+        geoLat, geoLon);
+
+    Serial.printf("Fetching weather: %s\n", url);
+
+    JsonDocument filter;
+    filter["current"]["time"] = true;
+    filter["current"]["temperature_2m"] = true;
+    filter["current"]["relative_humidity_2m"] = true;
+    filter["hourly"]["precipitation_probability"] = true;
+
+    JsonDocument doc;
+    if (!httpGetJson(url, doc, filter)) {
+        Serial.println("Error: no se pudo obtener el clima");
+        weather.valid = false;
+        return false;
+    }
+
+    weather.temperature = doc["current"]["temperature_2m"].as<float>();
+    weather.humidity = doc["current"]["relative_humidity_2m"].as<int>();
+
+    // precipitation_probability is an hourly series; pick the entry for the
+    // current hour, which equals the array index when forecast_days=1.
+    const char* currentTime = doc["current"]["time"] | "";
+    int hour = 0;
+    if (strlen(currentTime) >= 13) {
+        hour = (currentTime[11] - '0') * 10 + (currentTime[12] - '0');
+    }
+
+    JsonArray probs = doc["hourly"]["precipitation_probability"].as<JsonArray>();
+    weather.precipitationProb = 0;
+    if (hour >= 0 && hour < (int) probs.size()) {
+        weather.precipitationProb = probs[hour].as<int>();
+    }
+
+    weather.valid = true;
+    Serial.printf("Clima: %.1fC, humedad %d%%, lluvia %d%%\n",
+        weather.temperature, weather.humidity, weather.precipitationProb);
+    Serial.printf("Memoria libre: %d bytes\n", ESP.getFreeHeap());
+
+    return true;
+}
+
+// Format the current time for a POSIX timezone string as HH:MM
+void formatTimeInZone(const char* tz, char* buffer, size_t bufferSize) {
+    time_t now = time(nullptr);
+
+    // If time is not synchronized yet, show a placeholder
+    if (now < 24 * 3600) {
+        strncpy(buffer, "--:--", bufferSize - 1);
+        buffer[bufferSize - 1] = '\0';
+        return;
+    }
+
+    setenv("TZ", tz, 1);
+    tzset();
+
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    strftime(buffer, bufferSize, "%H:%M", &timeinfo);
 }
 
 // Draw text with word wrap
@@ -166,6 +395,57 @@ int drawWrappedText(const char* text, int x, int y, int maxWidth, int font) {
     return lineY;
 }
 
+// Convert a UTF-8 string to plain ASCII, folding accented Latin letters to
+// their base letter (á -> a, ñ -> n, ...). The built-in TFT fonts only
+// contain ASCII glyphs, so accented bytes would otherwise render as garbage.
+void asciiFold(char* dst, size_t dstSize, const char* src) {
+    static const char latin1[] =
+        "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPs"
+        "aaaaaaaceeeeiiiidnooooo/ouuuuypy";
+
+    size_t j = 0;
+    size_t i = 0;
+    while (src[i] != '\0' && j + 1 < dstSize) {
+        unsigned char c = (unsigned char) src[i];
+
+        if (c < 0x80) {
+            // Plain ASCII passes through unchanged
+            dst[j++] = (char) c;
+            i++;
+            continue;
+        }
+
+        // Multi-byte UTF-8: choose a replacement, then skip the whole sequence
+        char replacement = ' ';
+        if (c == 0xC3) {
+            // Latin-1 Supplement U+00C0..U+00FF -> base letter
+            unsigned char cont = (unsigned char) src[i + 1];
+            if (cont >= 0x80 && cont <= 0xBF) {
+                replacement = latin1[cont & 0x3F];
+            }
+        } else if (c == 0xC2) {
+            unsigned char cont = (unsigned char) src[i + 1];
+            if (cont == 0xBF) replacement = '?';        // inverted question mark
+            else if (cont == 0xA1) replacement = '!';   // inverted exclamation
+        } else if (c == 0xE2 && (unsigned char) src[i + 1] == 0x80) {
+            // General punctuation: dashes, smart quotes, ellipsis
+            unsigned char b = (unsigned char) src[i + 2];
+            if (b >= 0x90 && b <= 0x95) replacement = '-';
+            else if (b == 0x98 || b == 0x99) replacement = '\'';
+            else if (b == 0x9C || b == 0x9D) replacement = '"';
+            else if (b == 0xA6) replacement = '.';
+        }
+        dst[j++] = replacement;
+
+        // Advance past the lead byte and any UTF-8 continuation bytes (0x80..0xBF)
+        i++;
+        while ((unsigned char) src[i] >= 0x80 && (unsigned char) src[i] <= 0xBF) {
+            i++;
+        }
+    }
+    dst[j] = '\0';
+}
+
 // Fetch news from API
 bool fetchNews(const char* query) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -189,32 +469,8 @@ bool fetchNews(const char* query) {
     snprintf(buffer, sizeof(buffer), "Cargando: %s...", query);
     tft.drawString(buffer, 10, 10, 2);
 
-    // NewsAPI is served over HTTPS; setInsecure() skips TLS certificate
-    // validation to avoid bundling a CA cert. Traffic is still encrypted.
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.begin(client, url);
-    http.setTimeout(15000);
-
-    int httpCode = http.GET();
     totalArticles = 0;
     currentArticle = 0;
-
-    Serial.printf("HTTP Code: %d\n", httpCode);
-
-    if (httpCode != 200) {
-        Serial.printf("HTTP Error: %d\n", httpCode);
-        http.end();
-        return false;
-    }
-
-    String payload = http.getString();
-    http.end();
-
-    Serial.printf("Payload size: %d bytes\n", payload.length());
-    Serial.printf("Memoria tras payload: %d bytes\n", ESP.getFreeHeap());
 
     // JSON parsing with filter to reduce memory usage
     JsonDocument filter;
@@ -223,14 +479,7 @@ bool fetchNews(const char* query) {
     filter["articles"][0]["description"] = true;
 
     JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload,
-        DeserializationOption::Filter(filter));
-
-    // Clear payload string to free memory before parsing JSON
-    payload = String();
-
-    if (error) {
-        Serial.printf("JSON Error: %s\n", error.c_str());
+    if (!httpGetJson(url, doc, filter)) {
         return false;
     }
 
@@ -242,14 +491,12 @@ bool fetchNews(const char* query) {
     for (JsonObject article : arr) {
         if (count >= MAX_ARTICLES) break;
 
-        const char* title = article["title"] | "Sin título";
-        const char* desc = article["description"] | "Sin descripción";
+        const char* title = article["title"] | "Sin titulo";
+        const char* desc = article["description"] | "Sin descripcion";
 
-        strncpy(articles[count].title, title, MAX_TITLE - 1);
-        articles[count].title[MAX_TITLE - 1] = '\0';
-
-        strncpy(articles[count].description, desc, MAX_DESC - 1);
-        articles[count].description[MAX_DESC - 1] = '\0';
+        // Fold UTF-8 accents to ASCII — the TFT fonts have no accented glyphs
+        asciiFold(articles[count].title, MAX_TITLE, title);
+        asciiFold(articles[count].description, MAX_DESC, desc);
 
         Serial.printf("  Artículo %d: %s\n", count + 1, articles[count].title);
         count++;
@@ -291,7 +538,76 @@ void displayArticle(int index) {
     Serial.printf("Mostrando [%d/%d]: %s\n", index + 1, totalArticles, articles[index].title);
 }
 
-// Switch to next category
+// Display the combined weather + world clock screen
+void displayInfoScreen() {
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+    // Header
+    tft.drawString("Clima y Hora Mundial", 10, 4, 2);
+    tft.drawLine(5, 24, 315, 24, TFT_BLACK);
+
+    int y = 32;
+
+    // Weather block
+    if (weather.valid) {
+        tft.setTextColor(TFT_BLUE, TFT_WHITE);
+        tft.drawString(WEATHER_CITY, 10, y, 2);
+        y += 22;
+
+        char line[48];
+        snprintf(line, sizeof(line), "%.1f C", weather.temperature);
+        tft.setTextColor(TFT_RED, TFT_WHITE);
+        tft.drawString(line, 10, y, 4);
+        y += 32;
+
+        snprintf(line, sizeof(line), "Humedad %d%%   Lluvia %d%%",
+            weather.humidity, weather.precipitationProb);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString(line, 10, y, 2);
+        y += 20;
+    } else {
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("Clima no disponible", 10, y, 2);
+        y += 20;
+    }
+
+    // Separator
+    tft.drawLine(5, y + 2, 315, y + 2, TFT_BLACK);
+    y += 12;
+
+    // World clocks: labels in black, times in yellow and right-aligned near the edge
+    for (int i = 0; i < totalClocks; i++) {
+        char timeStr[8];
+        formatTimeInZone(worldClocks[i].tz, timeStr, sizeof(timeStr));
+
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString(worldClocks[i].label, 10, y, 4);
+
+        tft.setTextColor(TFT_YELLOW, TFT_WHITE);
+        int timeX = 310 - tft.textWidth(timeStr, 4);
+        tft.drawString(timeStr, timeX, y, 4);
+
+        y += 28;
+    }
+
+    // Restore UTC so the rest of the firmware computes dates consistently
+    setenv("TZ", "UTC0", 1);
+    tzset();
+
+    Serial.println("Mostrando pantalla de clima y hora");
+}
+
+// Show the current article and advance to the next one
+void showNewsScreen() {
+    displayArticle(currentArticle);
+    currentArticle++;
+    if (currentArticle >= totalArticles) {
+        currentArticle = 0;
+    }
+}
+
+// Switch to the next news category (refetches articles, does not draw)
 void nextCategory() {
     currentCategory++;
 
@@ -303,8 +619,6 @@ void nextCategory() {
     Serial.printf("Cambiando a categoría: %s\n", categories[currentCategory].query);
     fetchNews(categories[currentCategory].query);
     categoryStartTime = millis();
-    lastNewsSwitch = millis();
-    displayArticle(0);
 }
 
 // Setup
@@ -321,36 +635,48 @@ void setup() {
 
     connectWiFi();
 
+    // Resolve location and fetch the first weather report
+    resolveLocation();
+    if (geoValid) {
+        fetchWeather();
+        lastWeatherFetch = millis();
+    }
+
     // Load first category
     fetchNews(categories[0].query);
     categoryStartTime = millis();
-    lastNewsSwitch = millis();
+    lastScreenSwitch = millis();
 
-    if (totalArticles > 0) {
-        displayArticle(0);
-    }
+    // Start by showing the weather + clock screen
+    showingInfo = true;
+    displayInfoScreen();
 }
 
 // Main loop
 void loop() {
     unsigned long now = millis();
 
-    // Check whether it's time to change category
-    if (now - categoryStartTime >= categories[currentCategory].durationMs) {
-        nextCategory();
+    // Refresh weather data periodically
+    if (geoValid && now - lastWeatherFetch >= WEATHER_INTERVAL) {
+        fetchWeather();
+        lastWeatherFetch = now;
     }
 
-    // Check whether it's time to change article (every 1 minute)
-    if (now - lastNewsSwitch >= NEWS_INTERVAL) {
-        lastNewsSwitch = now;
-        currentArticle++;
+    // Every minute, alternate between the news and the weather + clock screen
+    if (now - lastScreenSwitch >= SCREEN_INTERVAL) {
+        lastScreenSwitch = now;
 
-        // If articles finished, wrap to start or change category
-        if (currentArticle >= totalArticles) {
-            currentArticle = 0;
+        // After a full category cycle (1 hour), move on to the next category
+        if (now - categoryStartTime >= categories[currentCategory].durationMs) {
+            nextCategory();
         }
 
-        displayArticle(currentArticle);
+        showingInfo = !showingInfo;
+        if (showingInfo) {
+            displayInfoScreen();
+        } else {
+            showNewsScreen();
+        }
     }
 
     delay(100);
