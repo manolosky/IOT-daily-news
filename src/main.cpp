@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
 #ifndef WIFI_SSID
 #include "secrets.h"
@@ -13,7 +14,6 @@ TFT_eSPI tft = TFT_eSPI();
 // WiFi configuration
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASS;
-const char* userName = USER_NAME;
 
 // NewsAPI configuration
 const char* apiKey = API_KEY;
@@ -27,10 +27,11 @@ struct NewsCategory {
 
 //12 hrs news from NewsAPI, categories and their respective durations in milliseconds
 NewsCategory categories[] = {
-    {"Tech",    3 * 60 * 60 * 1000UL},
-    {"Space",   3 * 60 * 60 * 1000UL},
-    {"Economy", 3 * 60 * 60 * 1000UL},
-    {"AI",      3 * 60 * 60 * 1000UL}
+    {"Tech",     1 * 60 * 60 * 1000UL},
+    {"Space",    1 * 60 * 60 * 1000UL},
+    {"AI",       1 * 60 * 60 * 1000UL},
+    {"Software", 1 * 60 * 60 * 1000UL},
+    {"Economy",  1 * 60 * 60 * 1000UL},
 };
 const int totalCategories = sizeof(categories) / sizeof(categories[0]);
 
@@ -54,17 +55,6 @@ unsigned long lastNewsSwitch = 0;
 unsigned long categoryStartTime = 0;
 const unsigned long NEWS_INTERVAL = 60 * 1000UL; // 1 minute
 
-// Function to display greeting message
-void helloOutput(const char* name) {
-    char buffer[50];
-
-    tft.fillScreen(TFT_WHITE);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-
-    sprintf(buffer, "Hola, %s", name);
-    tft.drawString(buffer, 10, 10, 3);
-}
-
 // Connect to WiFi
 void connectWiFi() {
     tft.fillScreen(TFT_WHITE);
@@ -82,10 +72,52 @@ void connectWiFi() {
     Serial.println("\nWiFi conectado");
     Serial.println(WiFi.localIP());
 
+    // Synchronize time with NTP
+    tft.fillScreen(TFT_WHITE);
+    tft.drawString("Sincronizando hora...", 10, 10, 2);
+    Serial.println("Sincronizando hora con NTP...");
+    
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    
+    time_t now = time(nullptr);
+    int attempts = 0;
+    while (now < 24 * 3600 && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+        attempts++;
+    }
+    Serial.println();
+
     tft.fillScreen(TFT_WHITE);
     tft.drawString("WiFi OK!", 10, 10, 2);
     tft.drawString(WiFi.localIP().toString().c_str(), 10, 30, 1);
     delay(2000);
+}
+
+// Get yesterday's date in YYYY-MM-DD format
+void getYesterdayDateString(char* buffer, size_t bufferSize) {
+    time_t now = time(nullptr);
+    
+    // If time is not synchronized, use hardcoded date
+    if (now < 24 * 3600) {
+        strncpy(buffer, "2026-05-20", bufferSize - 1);
+        buffer[bufferSize - 1] = '\0';
+        Serial.println("Advertencia: Hora no sincronizada, usando fecha por defecto");
+        return;
+    }
+    
+    time_t yesterday = now - (24 * 60 * 60);
+    struct tm* timeinfo = localtime(&yesterday);
+    
+    if (timeinfo == nullptr) {
+        strncpy(buffer, "2026-05-20", bufferSize - 1);
+        buffer[bufferSize - 1] = '\0';
+        Serial.println("Error: No se pudo obtener estructura de hora");
+        return;
+    }
+    
+    strftime(buffer, bufferSize, "%Y-%m-%d", timeinfo);
 }
 
 // Draw text with word wrap
@@ -140,8 +172,11 @@ bool fetchNews(const char* query) {
         connectWiFi();
     }
 
+    char dateFrom[11];
+    getYesterdayDateString(dateFrom, sizeof(dateFrom));
+
     char url[256];
-    sprintf(url, "%s%s&q=%s&pageSize=10", apiBase, apiKey, query);
+    sprintf(url, "%s%s&q=%s&from=%s&pageSize=10", apiBase, apiKey, query, dateFrom);
 
     Serial.printf("Fetching: %s\n", url);
     Serial.printf("Memoria libre: %d bytes\n", ESP.getFreeHeap());
@@ -201,8 +236,8 @@ bool fetchNews(const char* query) {
     for (JsonObject article : arr) {
         if (count >= MAX_ARTICLES) break;
 
-        const char* title = article["title"] | "Sin titulo";
-        const char* desc = article["description"] | "Sin descripcion";
+        const char* title = article["title"] | "Sin título";
+        const char* desc = article["description"] | "Sin descripción";
 
         strncpy(articles[count].title, title, MAX_TITLE - 1);
         articles[count].title[MAX_TITLE - 1] = '\0';
@@ -210,7 +245,7 @@ bool fetchNews(const char* query) {
         strncpy(articles[count].description, desc, MAX_DESC - 1);
         articles[count].description[MAX_DESC - 1] = '\0';
 
-        Serial.printf("  Articulo %d: %s\n", count + 1, articles[count].title);
+        Serial.printf("  Artículo %d: %s\n", count + 1, articles[count].title);
         count++;
     }
 
@@ -259,7 +294,7 @@ void nextCategory() {
         Serial.println("Ciclo completo, reiniciando...");
     }
 
-    Serial.printf("Cambiando a categoria: %s\n", categories[currentCategory].query);
+    Serial.printf("Cambiando a categoría: %s\n", categories[currentCategory].query);
     fetchNews(categories[currentCategory].query);
     categoryStartTime = millis();
     lastNewsSwitch = millis();
@@ -277,9 +312,6 @@ void setup() {
 
     tft.init();
     tft.setRotation(1);
-
-    helloOutput(userName);
-    delay(2000);
 
     connectWiFi();
 
@@ -300,7 +332,6 @@ void loop() {
     // Check whether it's time to change category
     if (now - categoryStartTime >= categories[currentCategory].durationMs) {
         nextCategory();
-        return;
     }
 
     // Check whether it's time to change article (every 1 minute)
